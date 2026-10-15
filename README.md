@@ -1,304 +1,375 @@
-# Real-Time Hinglish Moderation Platform
+# Hinglish Moderation Platform
 
-Streaming moderation system for Hinglish (Hindi-English code-mixed) chat: classifies
-messages, tracks per-user trust/velocity, and detects coordinated campaigns via
-SimHash + Union-Find clustering.
+A real-time content moderation pipeline for **Hinglish** (Hindi–English code-mixed) chat. It classifies each message, tracks per-user trust and posting velocity, and detects coordinated spam or abuse campaigns using **SimHash fingerprints and Union-Find clustering**, with a live Streamlit dashboard and a moderator feedback loop for continuous improvement.
 
-This repo runs **end-to-end today** using synthetic sample data (`data/sample/`) so you
-can see the whole pipeline work before plugging in real datasets and a fine-tuned model.
+> **Project status:** The streaming pipeline, campaign detection, trust scoring, dashboard and evaluation tooling are complete and runnable on synthetic data. The default classifier is a **rule-based placeholder**, not a trained model. A fine-tuning path for HingBERT / HingRoBERTa is included, but no trained weights or real datasets ship with this repository. See [Current Status](#current-status) and [Limitations](#limitations).
 
 ---
 
-## 0. What's already done vs. what YOU need to do
+## Table of Contents
 
-| Piece | Status |
+- [Features](#features)
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Quick Start](#quick-start)
+- [Project Structure](#project-structure)
+- [How It Works](#how-it-works)
+- [Configuration](#configuration)
+- [Tooling and Evaluation](#tooling-and-evaluation)
+- [Training a Real Model](#training-a-real-model)
+- [Moderator Feedback Loop](#moderator-feedback-loop)
+- [Testing](#testing)
+- [Current Status](#current-status)
+- [Limitations](#limitations)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+
+---
+
+## Features
+
+- **Streaming pipeline:** Kafka-compatible ingestion (Redpanda) with a consumer that normalizes, classifies, clusters and scores every message.
+- **Three-level verdicts:** `safe`, `abusive`, `severe`, mapped to the actions `published`, `flagged` and `held_for_review`.
+- **Campaign detection:** Word-level 64-bit SimHash plus Union-Find groups near-duplicate messages across users and channels, and is robust to word reordering and changing URLs.
+- **Trust and rate limiting:** Redis-backed per-user trust score (0.0–1.0) and a sliding-window velocity limiter that tightens for low-trust users.
+- **Live dashboard:** Streamlit UI with a live feed, user trust table, campaign clusters and a moderator review panel.
+- **Active-learning loop:** Moderators confirm or overturn verdicts, and the decisions export as training-ready CSV rows.
+- **Empirical tuning tools:** Scripts to calibrate the SimHash threshold and velocity limits instead of guessing.
+- **Adversarial test suite:** 24 hand-written Hinglish edge cases (negation, sarcasm, reclaimed slang, obfuscation, mixed scripts) with a per-category report.
+- **Model tooling:** Data preparation and quality report, model bake-off (HingBERT vs HingRoBERTa vs MuRIL), fine-tuning, evaluation, ONNX export and a latency benchmark.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    P[Producer<br/>chat simulator] -->|chat-events| K[(Redpanda / Kafka)]
+    K --> C
+
+    subgraph C[Consumer pipeline]
+        direction TB
+        N[1. Normalize] --> CL[2. Classify]
+        CL --> S[3. SimHash + Union-Find<br/>campaign clustering]
+        S --> T[4. Trust score +<br/>rate limit]
+        T --> D[Final status]
+    end
+
+    C -->|verdicts, campaigns| R[(Redis)]
+    R --> UI[Streamlit dashboard]
+    UI -->|confirm / overturn| R
+    R -->|export_feedback_queue.py| CSV[Training CSV]
+```
+
+**Message statuses**
+
+| Condition | Status |
 |---|---|
-| Docker Compose (Redpanda + Redis) | ✅ Done |
-| Kafka producer (simulator) | ✅ Done — uses `data/sample/sample_messages.jsonl` for now |
-| Kafka consumer pipeline (normalize → classify → simhash → trust) | ✅ Done — classifier stage uses a placeholder rule-based scorer until you plug in a real model |
-| SimHash + Union-Find campaign clustering | ✅ Done, tested, threshold empirically calibrated |
-| Redis trust score + rate limiting | ✅ Done, tested, velocity limit empirically calibrated |
-| Streamlit dashboard | ✅ Done |
-| Data prep/cleaning + quality report | ✅ Done, tested (`scripts/prepare_data.py`) |
-| Model bake-off (HingBERT/HingRoBERTa/MuRIL) | ✅ Script written — **you run it**, needs HF access + GPU for finetune mode |
-| Fine-tuning script (HingBERT/HingRoBERTa on Bohra) | ✅ Script written — **you run it**, needs GPU + real data |
-| Tier 3 adversarial test set + runner | ✅ Done, tested (`data/tricky_test_messages.md`, `scripts/run_tricky_tests.py`) |
-| Active learning / moderator feedback loop | ✅ Done, tested — dashboard review panel + `scripts/export_feedback_queue.py` |
-| Latency benchmark harness (stretch) | ✅ Done, tested — runs today against placeholder, ready for real model |
-| ONNX export + verification (stretch) | ✅ Script written — **you run it**, needs a real fine-tuned checkpoint |
-| Real datasets (Bohra 2018, PRISM, HateCheckHIn) | ❌ **You download these** (see §2) |
-| Real model weights (HingBERT/HingRoBERTa) | ❌ **You download these** (see §2) |
-| Actually running training / bake-off | ❌ **You run this on Colab/Kaggle** (see §2b/§3) |
-
-Why: my sandbox can only reach pypi/npm/github — not Hugging Face, Kaggle, or Twitter's
-API, which is where the real data and model weights live. Everything code-related is
-built and runnable; the data/model fetching has to happen on your machine or in Colab.
+| Label is `severe` | `held_for_review` |
+| Label is `abusive`, or the user exceeded their velocity limit | `flagged` |
+| Otherwise | `published` |
 
 ---
 
-## 1. Quick start (runs right now, with synthetic data)
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| Messaging | Redpanda (Kafka API), `kafka-python` |
+| State and storage | Redis 7 |
+| Campaign detection | `simhash`, custom Union-Find |
+| Dashboard | Streamlit, pandas |
+| Modeling | Hugging Face `transformers`, PyTorch, `datasets`, scikit-learn |
+| Optional deployment | ONNX / `optimum` |
+| Infrastructure | Docker Compose |
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.10+
+- Docker and Docker Compose
+
+### 1. Start infrastructure
 
 ```bash
-# 1. Start infra
-docker compose up -d
-# (or `make up`)
+docker compose up -d        # or: make up
+```
 
-# 2. Install deps
-python -m venv venv && source venv/bin/activate
+This starts Redpanda (port `9092`), the Redpanda Console (`8080`) and Redis (host port **`6380`**).
+
+### 2. Install dependencies
+
+```bash
+python -m venv venv
+source venv/bin/activate    # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-# (or `make install`)
-
-# 3. Sanity-check the pipeline logic without Kafka (needs only Redis up)
-python scripts/smoke_test.py
-# (or `make smoke-test`)
-
-# 4. Terminal A: start the consumer (pipeline)
-python consumer/consumer.py
-
-# 5. Terminal B: start the producer (replays data/sample/sample_messages.jsonl)
-python producer/producer.py
-
-# 6. Terminal C: dashboard
-streamlit run dashboard/app.py
-# (or `make dashboard`)
 ```
 
-You should see messages flow through Kafka → consumer → Redis, with verdicts and
-campaign clusters showing up live in the dashboard. The classifier is currently a
-**placeholder rule-based scorer** (keyword + heuristic) — good enough to prove the
-pipeline works, not good enough to claim "AI moderation." Swap it for the real model
-per §3.
+> `requirements.txt` includes `torch` and `transformers`, which are large. They are only needed once you use a real model; the placeholder classifier does not require them.
 
-If Kafka/Redpanda gives you setup friction (a known risk per the plan, §7), run
-`scripts/smoke_test.py` first — it exercises the full classify → cluster → trust
-pipeline directly against the sample data with only Redis running, so you can
-confirm the pipeline logic itself is correct independent of the broker.
-
----
-
-## 1b. Tools for the "empirical tuning" parts of the plan
-
-The plan (§6/§7) is explicit that the SimHash threshold and classifier quality need
-real tuning, not values copied from a tutorial. Two scripts help with that:
-
-**`python scripts/tune_simhash_threshold.py`** (or `make tune-threshold`) — sweeps
-Hamming-distance thresholds against labeled same-campaign / different-campaign
-message pairs and reports recall vs. false-merge count at each threshold, so you
-pick a number with actual precision/recall behind it. Pre-loaded with pairs from
-the sample spam block; swap in your own labeled pairs once you have real injected
-spam (Week 6).
-
-**`python scripts/run_tricky_tests.py`** (or `make tricky-tests`) — runs the 24
-hand-written adversarial test messages in `data/tricky_test_messages.md` (sarcasm,
-negation, reclaimed slang, obfuscation, script-mixing) through the classifier and
-reports where it disagrees with the expected human judgment, broken down by
-category. This is the Tier 3 testing and failure-mode documentation the plan (§8)
-asks for. Run this again once you've swapped in the real fine-tuned model — the
-placeholder scorer currently fails most negation/sarcasm cases by design (it's
-pure keyword matching), which is worth showing explicitly in your report as the
-reason a real model is needed.
-
-**`python scripts/tune_rate_limits.py`** (or `make tune-rate-limits`) — same idea
-applied to `DEFAULT_VELOCITY_LIMIT`/`TIGHTENED_VELOCITY_LIMIT` in
-`consumer/trust.py` (plan §6, Week 5). Simulates a few user behavior patterns
-(casual chatter, active legit user, burst spammer, slow-drip spammer) and reports
-which candidate limits cause false positives on legitimate users vs. missing real
-spam bursts. This is how the current default (20 msgs/min) was picked — the
-original naive guess of 12 turned out to false-positive on a fast-but-legitimate
-active user in the simulation. Re-run with real behavior once you have it.
-
----
-
-## 2. Getting the real datasets and model (you do this locally, not in this chat)
-
-**HingBERT / HingRoBERTa (model weights)** — CC-BY-4.0, free, no registration:
-```bash
-pip install transformers torch
-python -c "from transformers import AutoTokenizer, AutoModel; \
-AutoTokenizer.from_pretrained('l3cube-pune/hing-roberta'); \
-AutoModel.from_pretrained('l3cube-pune/hing-roberta')"
-```
-This downloads from Hugging Face automatically the first time you run it, as long as
-you have internet access (your machine will, even though my sandbox doesn't).
-
-**Bohra et al. 2018 dataset** — public tweet-ID release. Because it's ID-only, you need
-to "hydrate" the IDs into full tweets yourself (Twitter/X API access, or a hydration
-tool like `twarc`). Search: "Bohra 2018 hindi-english code-mixed hate speech dataset
-github" — the repo has the ID list and hydration instructions.
-
-**PRISM dataset** — on Hugging Face, MIT license:
-```python
-from datasets import load_dataset
-ds = load_dataset("<PRISM dataset repo — search Hugging Face for 'PRISM code-mixed'>")
-```
-
-**HateCheckHIn** — public GitHub repo with the diagnostic test suite. Search
-"HateCheckHIn github" and clone it into `data/hatecheckhin/`.
-
-Once you have these, drop them into:
-```
-data/bohra/          # raw + processed Bohra data
-data/prism/          # PRISM augmentation set
-data/hatecheckhin/   # diagnostic suite
-```
-
----
-
-## 2b. Cleaning your data and picking a model (Week 1, plan §5)
-
-Once you've hydrated Bohra (or pulled PRISM), don't feed it straight into
-`scripts/train.py` — run it through the prep/inspection step first:
+### 3. Verify the pipeline (Kafka not required)
 
 ```bash
-python scripts/prepare_data.py \
-    --raw_csv data/bohra/raw_hydrated.csv \
-    --text_col tweet_text --label_col hate_label \
-    --label_map "none:0,offensive:1,hateful:2" \
-    --output_dir data/bohra
+python scripts/smoke_test.py    # or: make smoke-test
 ```
 
-This drops missing/empty/duplicate rows, prints class balance and text-length
-stats, warns if one class dominates (>85%) — which macro-F1 is sensitive to —
-and does a stratified train/test split so rare classes show up in both splits.
-This is the "look at the data yourself" step the plan (§6) says not to skip;
-the printed report is what to actually look at, not just the row count.
+This runs the full classify → cluster → trust flow directly against the sample data and needs only Redis. **Note:** it flushes the Redis database it connects to.
 
-Then run the Week 1 model bake-off to lock in HingBERT vs HingRoBERTa vs MuRIL
-with a reason instead of an assumption:
+### 4. Run the full stack
+
+Use three terminals:
 
 ```bash
-# fast sanity check, no training
-python scripts/model_bakeoff.py --data_dir data/bohra --mode zero_shot
-
-# slower but meaningful: small fine-tune + macro-F1 comparison per model
-python scripts/model_bakeoff.py --data_dir data/bohra --mode finetune --epochs 2 --sample_size 2000
+python consumer/consumer.py              # Terminal A: pipeline
+python producer/producer.py --loop       # Terminal B: replays sample data
+streamlit run dashboard/app.py           # Terminal C: dashboard
 ```
 
-`--mode finetune` is the one that actually answers the question — budget
-15-30 min per model on a free Colab GPU. Whichever wins on macro-F1 is what you
-pass as `--model_name` to the real `scripts/train.py` run.
+Open the dashboard at <http://localhost:8501>. The dashboard does not poll automatically, so use the **Refresh** button to see new messages.
+
+Producer options: `--source`, `--bootstrap-servers`, `--min-delay`, `--max-delay`, `--loop`.
 
 ---
 
-## 3. Fine-tuning (you run this, I can't — needs a GPU)
-
-`scripts/train.py` is a full Hugging Face `Trainer`-based fine-tuning script, ready to
-run once you have Bohra data in `data/bohra/train.csv` and `data/bohra/test.csv`
-(columns: `text`, `label`). Upload the repo to Colab/Kaggle, attach a free GPU runtime,
-and run:
-
-```bash
-python scripts/train.py --data_dir data/bohra --model_name l3cube-pune/hing-roberta --output_dir models/hingroberta-finetuned
-```
-
-Watch the loss curve, decide when it's converged (this is the "your judgment" part —
-see plan §6). When done, point `consumer/classifier.py` at the checkpoint in
-`models/hingroberta-finetuned` instead of the placeholder scorer (see the `TODO` in
-that file — it's a single function swap).
-
----
-
-## 4. Project structure
+## Project Structure
 
 ```
 hinglish-mod-platform/
-├── docker-compose.yml       # Redpanda + Redis
+├── docker-compose.yml           # Redpanda, Redpanda Console, Redis
+├── Makefile                     # Convenience targets
 ├── requirements.txt
-├── Makefile                 # convenience commands (make up/install/test/...)
-├── producer/producer.py     # simulated chat stream → Kafka
+├── producer/
+│   └── producer.py              # Simulated chat stream → Kafka
 ├── consumer/
-│   ├── consumer.py          # main pipeline loop
-│   ├── classifier.py        # placeholder scorer (swap for real model)
-│   ├── simhash_cluster.py   # SimHash + Union-Find campaign detection
-│   ├── trust.py             # Redis trust score + rate limiting
-│   └── feedback.py          # moderator confirm/overturn store (active learning loop)
-├── dashboard/app.py         # Streamlit live dashboard + moderator review panel
+│   ├── consumer.py              # Main pipeline loop
+│   ├── classifier.py            # RuleBasedClassifier (placeholder) + HingBertClassifier
+│   ├── simhash_cluster.py       # SimHash + Union-Find campaign detection
+│   ├── trust.py                 # Redis trust score + sliding-window rate limiter
+│   └── feedback.py              # Moderator confirm/overturn store
+├── dashboard/
+│   └── app.py                   # Streamlit dashboard + review panel
 ├── scripts/
-│   ├── prepare_data.py              # raw data cleaning + quality report + train/test split
-│   ├── model_bakeoff.py             # Week 1: HingBERT vs HingRoBERTa vs MuRIL comparison
-│   ├── train.py                     # HF Trainer fine-tuning script (run on Colab/Kaggle)
-│   ├── evaluate.py                  # macro-F1 + HateCheckHIn evaluation
-│   ├── tune_simhash_threshold.py    # empirical SimHash threshold calibration
-│   ├── tune_rate_limits.py          # empirical velocity limit calibration
-│   ├── run_tricky_tests.py          # Tier 3 adversarial test runner
-│   ├── smoke_test.py                # Kafka-free end-to-end pipeline check
-│   ├── export_feedback_queue.py     # active learning loop: feedback -> training CSV
-│   ├── latency_benchmark.py         # p50/p95/p99 latency + throughput (stretch)
-│   └── export_onnx.py               # ONNX export + verification (stretch)
+│   ├── prepare_data.py          # Cleaning, quality report, stratified split
+│   ├── model_bakeoff.py         # HingBERT vs HingRoBERTa vs MuRIL
+│   ├── train.py                 # Hugging Face Trainer fine-tuning
+│   ├── evaluate.py              # Macro-F1 + HateCheckHIn evaluation
+│   ├── run_tricky_tests.py      # Adversarial test runner
+│   ├── tune_simhash_threshold.py
+│   ├── tune_rate_limits.py
+│   ├── smoke_test.py            # Kafka-free end-to-end check
+│   ├── export_feedback_queue.py # Moderator feedback → training CSV
+│   ├── latency_benchmark.py     # p50/p95/p99 latency, throughput
+│   └── export_onnx.py           # ONNX export + output verification
 ├── data/
-│   ├── sample/sample_messages.jsonl   # synthetic Hinglish messages for local testing
-│   └── tricky_test_messages.md        # 24 hand-written adversarial test cases
-└── tests/                   # unit tests for simhash/union-find/trust logic
+│   ├── sample/sample_messages.jsonl   # 25 synthetic messages
+│   └── tricky_test_messages.md        # Adversarial test set (24 cases)
+├── models/                      # Fine-tuned checkpoints (git-ignored)
+└── tests/
 ```
 
 ---
 
-## 9. Stretch goals — what's ready to run
+## How It Works
 
-**Active learning / moderator feedback loop** (plan §9) — the dashboard now has a
-"Moderator review" panel: for any flagged/held-for-review message, click Confirm
-or pick a corrected label and click Overturn. Decisions are stored in Redis
-(`consumer/feedback.py`). Export them into training-ready CSV rows with:
+### 1. Classification
+
+`consumer/classifier.py` exposes a single interface, `predict(text) -> {"label", "confidence"}`, with two implementations:
+
+- **`RuleBasedClassifier`** (default): keyword lexicon placeholder. It exists so the pipeline runs end to end without a model. It is **not** suitable for real moderation (see [Limitations](#limitations)).
+- **`HingBertClassifier`**: loads a fine-tuned Hugging Face sequence-classification checkpoint. Label order is `0=safe, 1=abusive, 2=severe`.
+
+To switch, change `get_classifier()` at the bottom of `consumer/classifier.py`:
+
+```python
+def get_classifier():
+    return HingBertClassifier(model_path="models/hingroberta-finetuned")
+```
+
+### 2. Campaign detection
+
+1. Text is normalized for fingerprinting (lowercased, URLs, digits and punctuation removed; Roman script only).
+2. A word-level 64-bit **SimHash** is computed. Word features keep reordered spam variants close together.
+3. The new fingerprint is compared with fingerprints from the last 10 minutes; pairs within a **Hamming distance of 15** are unioned.
+4. Clusters of **3 or more** messages are reported as campaigns (`C-xxxxxxxx`) with message, user and channel counts.
+
+On the bundled synthetic data, near-duplicate spam lands 0–13 bits apart and unrelated messages 18+ bits apart. This is a small synthetic set, so re-tune on real data (see [Tooling](#tooling-and-evaluation)).
+
+### 3. Trust and rate limiting
+
+| Event | Trust change |
+|---|---|
+| `safe` message | +0.02 |
+| `abusive` message | −0.08 |
+| `severe` message | −0.25 |
+| Rate-limit trip | −0.15 additional |
+
+New users start at `0.5`. Messages per 60 seconds above **20** trip the limiter, or above **8** if trust is below `0.3`. State is stored in Redis (`user:{id}:trust`, `user:{id}:velocity`).
+
+### Redis keys
+
+| Key | Type | Purpose |
+|---|---|---|
+| `moderation:recent_verdicts` | list (capped at 500) | Latest verdict records for the dashboard |
+| `moderation:campaigns` | hash | Campaign summaries |
+| `moderation:feedback` | hash | Moderator decisions |
+| `user:{id}:trust` | string | Trust score |
+| `user:{id}:velocity` | sorted set | Message timestamps in the window |
+
+---
+
+## Configuration
+
+Values are currently set as constants or CLI flags.
+
+| Setting | Location | Default |
+|---|---|---|
+| Kafka bootstrap servers | `--bootstrap-servers` (consumer, producer) | `localhost:9092` |
+| Redis host / port | `--redis-host`, `--redis-port` (consumer) | `localhost` / `6380` |
+| Kafka topic | `TOPIC` in producer and consumer | `chat-events` |
+| Hamming threshold | `HAMMING_THRESHOLD` in `simhash_cluster.py` | `15` |
+| Min campaign size | `MIN_CLUSTER_SIZE` | `3` |
+| Fingerprint window | `RECENT_WINDOW_SECONDS` | `600` |
+| Velocity limits | `DEFAULT_VELOCITY_LIMIT` / `TIGHTENED_VELOCITY_LIMIT` in `trust.py` | `20` / `8` per 60 s |
+
+> The dashboard, smoke test and feedback export scripts hard-code Redis at `localhost:6380`.
+
+---
+
+## Tooling and Evaluation
+
+| Command | Purpose |
+|---|---|
+| `make tune-threshold` | Sweep Hamming thresholds; report recall vs. false merges |
+| `make tune-rate-limits` | Simulate user behavior patterns against candidate velocity limits |
+| `make tricky-tests` | Run the adversarial set; per-category accuracy and mismatches |
+| `make latency-bench` | p50/p95/p99 latency and throughput of the classifier |
+| `make smoke-test` | Kafka-free end-to-end check (needs Redis) |
+
+### Baseline: placeholder classifier on the adversarial set
+
+| Category | Accuracy |
+|---|---|
+| Control, sarcasm, threats | 100% |
+| Script mixing | 50% |
+| Targeted abuse, reclaimed slang | 33% |
+| Obfuscation | 25% |
+| Negation, borderline profanity | 0% |
+| **Overall** | **10 / 24 (42%)** |
+
+This baseline is intentional: pure keyword matching cannot handle negation, context or obfuscation. It sets the bar a fine-tuned model must clear. Sarcasm scores 100% only because the sarcastic examples contain no lexicon terms, so it reflects no real understanding.
+
+---
+
+## Training a Real Model
+
+Datasets and weights are not included. You need to obtain them yourself:
+
+| Resource | Notes |
+|---|---|
+| [HingBERT / HingRoBERTa](https://huggingface.co/l3cube-pune) (L3Cube) | Downloaded automatically by `transformers` |
+| Bohra et al. (2018) Hinglish hate speech | Tweet IDs only; must be hydrated |
+| PRISM, HateCheckHIn | Optional augmentation and diagnostic suite |
+
+Check each dataset's license and terms before use.
+
+```bash
+# 1. Clean data and print a quality report; writes train.csv / test.csv
+python scripts/prepare_data.py --raw_csv data/bohra/raw_hydrated.csv \
+    --text_col tweet_text --label_col hate_label \
+    --label_map "none:0,offensive:1,hateful:2" --output_dir data/bohra
+
+# 2. Compare candidate models (GPU recommended)
+python scripts/model_bakeoff.py --data_dir data/bohra --mode finetune --epochs 2 --sample_size 2000
+
+# 3. Fine-tune
+python scripts/train.py --data_dir data/bohra \
+    --model_name l3cube-pune/hing-roberta --output_dir models/hingroberta-finetuned
+
+# 4. Evaluate (macro-F1, optional HateCheckHIn breakdown)
+python scripts/evaluate.py --model_path models/hingroberta-finetuned --test_csv data/bohra/test.csv
+
+# 5. Optional: export to ONNX and benchmark
+pip install "optimum[onnxruntime]" onnx onnxruntime
+python scripts/export_onnx.py --model_path models/hingroberta-finetuned --output_path models/hingroberta-onnx
+python scripts/latency_benchmark.py --mode onnx --model_path models/hingroberta-onnx
+```
+
+Training data must be a CSV with `text` and integer `label` columns (`0=safe`, `1=abusive`, `2=severe`). Fine-tuning requires a GPU, and Colab or Kaggle free tiers are sufficient for the bake-off.
+
+---
+
+## Moderator Feedback Loop
+
+1. Open the **Moderator review** panel in the dashboard.
+2. For each flagged or held message, click **Confirm** or choose a corrected label and click **Overturn**.
+3. Export decisions as training rows:
 
 ```bash
 python scripts/export_feedback_queue.py --output data/bohra/feedback_batch_1.csv
 ```
 
-Tested end-to-end with synthetic moderator decisions — confirms/overturns are
-recorded correctly, already-reviewed messages don't reappear in the panel, and
-the export correctly maps corrected labels to the training label scheme. Appends
-onto `data/bohra/train.csv` for your next fine-tuning cycle; the script also
-warns if the overturn rate is high enough (>30%) that you should investigate the
-classifier's specific failure pattern (e.g. via `run_tricky_tests.py`-style
-category breakdown) before assuming more data alone fixes it.
-
-**Latency benchmarking** (`scripts/latency_benchmark.py`) — works right now
-against the placeholder classifier for a baseline, and against a real model with
-no code changes once you have one:
-
-```bash
-python scripts/latency_benchmark.py --mode placeholder --iterations 200   # runs today
-python scripts/latency_benchmark.py --mode pytorch --model_path models/hingroberta-finetuned
-python scripts/latency_benchmark.py --mode onnx --model_path models/hingroberta-onnx
-```
-
-Reports p50/p95/p99 latency and throughput. This is the "measured systems
-contribution" the plan (§9) calls out as turning "I fine-tuned a model" into an
-actual number.
-
-**ONNX export** (`scripts/export_onnx.py`) — exports a fine-tuned checkpoint to
-ONNX and verifies its outputs match the original PyTorch model within tolerance
-before you trust any latency numbers from it:
-
-```bash
-pip install optimum[onnxruntime] onnx onnxruntime
-python scripts/export_onnx.py --model_path models/hingroberta-finetuned --output_path models/hingroberta-onnx
-```
-
-**Not yet started** (per plan §9, lower priority — only pursue if core finishes
-early): PRISM as OOD eval, Marathi extension via MeBERT/L3Cube-MeCorpus, real
-Discord/Telegram bot integration, token-level explainability (why a message was
-flagged). I've held off scaffolding these because they either need real API
-credentials I can't test against, or a real fine-tuned model to be meaningful —
-happy to build them once you're further along, so I'm not guessing at
-integration details I can't verify.
+The export warns when the overturn rate exceeds 30%, which usually points to a systematic classifier weakness rather than a data shortage.
 
 ---
 
-## 5. Next steps (map to your Week 1-2 deliverables)
+## Testing
 
-- [x] Kafka/Redpanda + Redis local setup
-- [x] Chat-stream simulator (currently on synthetic data — swap source in
-      `producer/producer.py` once you have Bohra/PRISM downloaded)
-- [x] Data prep/cleaning tooling ready (`scripts/prepare_data.py`) — run it once you
-      have hydrated Bohra data
-- [x] Model bake-off tooling ready (`scripts/model_bakeoff.py`) — run it on Colab/Kaggle
-      once you have data prepped, to lock in HingBERT vs HingRoBERTa vs MuRIL with a reason
-- [x] End-to-end message flow working, classified with placeholder scorer
-- [x] SimHash threshold empirically calibrated against synthetic spam (re-run
-      `scripts/tune_simhash_threshold.py` once you have real injected spam)
-- [x] Tier 3 adversarial test set ready (`data/tricky_test_messages.md` — re-run
-      `scripts/run_tricky_tests.py` once you've swapped in the real fine-tuned model)
+```bash
+make test        # pytest; needs Redis on localhost:6380
+```
 
-Everything from Week 3 onward (real fine-tuning, HateCheckHIn pass) depends on you
-having pulled the real data/model per §2, and running §2b/§3 on a GPU.
+- `tests/test_simhash_cluster.py`: Union-Find, near-duplicate clustering, cross-channel campaigns (no external services).
+- `tests/test_feedback.py`: feedback store logic (requires Redis; **it flushes the database**, so do not point it at a Redis instance holding data you want to keep).
+
+---
+
+## Current Status
+
+| Component | Status |
+|---|---|
+| Docker Compose (Redpanda, Redis) | Done |
+| Producer and consumer pipeline | Done |
+| SimHash + Union-Find campaign detection | Done, tuned on synthetic data |
+| Trust score and rate limiting | Done, tuned on simulated patterns |
+| Streamlit dashboard and review panel | Done |
+| Feedback export, tuning and benchmark scripts | Done |
+| Fine-tuned Hinglish model | **Not included** (placeholder in use) |
+| Real datasets, trained checkpoints | **Not included** |
+| Load testing at production scale | Not performed |
+
+## Limitations
+
+- **The default classifier is not a real moderation model.** It matches a small keyword list, so it flags benign uses (`"yeh bilkul bakwas nahi hai"`), misses obfuscated terms (`ch*tiya`, `b3wakoof`) and ignores Devanagari. Do not use it to make moderation decisions on real users.
+- **Campaign detection does not yet change a message's status.** Detected campaigns appear in the dashboard, but messages in a campaign are still `published` unless another rule flags them. The first messages of a campaign are also published before the cluster reaches the minimum size.
+- **Detector state is in memory.** Campaign state is lost on consumer restart, grows without bound (only fingerprints are pruned), and the comparison is a linear scan. It is not suitable for high-throughput use without an LSH index and Redis-backed storage.
+- **Roman-script only fingerprinting.** Devanagari text is ignored by the SimHash normalizer.
+- **Thresholds are tuned on tiny synthetic sets** (25 messages, 6-message spam block). Re-tune on real data before relying on them.
+- **Single consumer, no authentication** on the dashboard or Redis. This is a development setup, not a hardened deployment.
+
+## Roadmap
+
+- [ ] Fine-tune and evaluate HingRoBERTa on real data; publish macro-F1 and HateCheckHIn results
+- [ ] Feed campaign membership into the final moderation decision
+- [ ] Redis-backed fingerprint store with an LSH index
+- [ ] Devanagari and transliteration normalization (leetspeak, symbol obfuscation)
+- [ ] Token-level explainability for flagged messages
+- [ ] Discord / Telegram integration
+- [ ] Marathi extension
+- [ ] Environment-variable configuration and CI
+
+## Contributing
+
+Issues and pull requests are welcome. Please run `make test` and `make tricky-tests` before submitting changes, and include before/after numbers for anything that affects classification or clustering.
+
+## License
+
+No license has been specified yet. Add a `LICENSE` file (for example MIT or Apache-2.0) before publishing so others know how they may use the code.
+
+## Acknowledgements
+
+- [L3Cube](https://github.com/l3cube-pune) for HingBERT and HingRoBERTa
+- Bohra et al. (2018) for the Hindi-English code-mixed hate speech dataset
+- HateCheckHIn and PRISM dataset authors
