@@ -41,7 +41,6 @@ A real-time content moderation pipeline for **Hinglish** (Hindi–English code-m
 ---
 
 ## Architecture
-
 ```mermaid
 flowchart LR
     P[Producer<br/>chat simulator] -->|chat-events| K[(Redpanda / Kafka)]
