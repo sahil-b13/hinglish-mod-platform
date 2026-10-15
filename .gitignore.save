@@ -1,0 +1,15 @@
+x
+venv/
+__pycache__/
+*.pyc
+.env
+models/*/
+!models/.gitkeep
+data/bohra/
+data/prism/
+data/hatecheckhin/
+.streamlit/
+*.log
+.DS_Store
+
+
